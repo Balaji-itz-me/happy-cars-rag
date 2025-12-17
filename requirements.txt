@@ -1,4 +1,3 @@
-cat > requirements.txt << 'EOF'
 fastapi==0.118.3
 uvicorn[standard]==0.38.0
 psycopg2-binary==2.9.11
@@ -8,4 +7,3 @@ python-dotenv==1.0.0
 pydantic==2.12.3
 torch==2.9.0
 transformers==4.57.3
-EOF

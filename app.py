@@ -15,14 +15,26 @@ groq_client = None
 db_conn = None
 db_cur = None
 
+def get_embedder():
+    """Lazy load embedder only when needed"""
+    global embedder
+    if embedder is None:
+        print("Loading embedder...")
+        embedder = SentenceTransformer("all-MiniLM-L6-v2")
+    return embedder
+
+def get_reranker():
+    """Lazy load reranker only when needed"""
+    global reranker
+    if reranker is None:
+        print("Loading reranker...")
+        reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+    return reranker
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Initialize models and connections
-    global embedder, reranker, groq_client, db_conn, db_cur
-    
-    print("Loading models...")
-    embedder = SentenceTransformer("all-MiniLM-L6-v2")
-    reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+    # Startup: Initialize only essential connections
+    global groq_client, db_conn, db_cur
     
     print("Initializing Groq client...")
     groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
@@ -38,7 +50,7 @@ async def lifespan(app: FastAPI):
     )
     db_cur = db_conn.cursor()
     
-    print("Startup complete!")
+    print("Startup complete! Models will load on first request.")
     
     yield
     
@@ -105,7 +117,8 @@ You are answering for Indian customers.
 
 def retrieve_candidates(query: str, model_filter: Optional[str] = None, limit: int = 12):
     """Retrieve candidate documents from the database"""
-    q_embedding = embedder.encode(query).tolist()
+    emb = get_embedder()  # Lazy load
+    q_embedding = emb.encode(query).tolist()
     
     if model_filter:
         sql = """
@@ -173,8 +186,9 @@ def rerank_docs(query: str, docs: list, top_k: int = 3):
     if not filtered:
         return []
     
+    ranker = get_reranker()  # Lazy load
     pairs = [(query, d["text"]) for d in filtered]
-    scores = reranker.predict(pairs)
+    scores = ranker.predict(pairs)
     
     ranked = sorted(
         zip(scores, filtered),
@@ -281,7 +295,10 @@ def health_check():
     return {
         "status": "healthy",
         "database": db_status,
-        "models_loaded": embedder is not None and reranker is not None
+        "models": {
+            "embedder": "loaded" if embedder is not None else "not_loaded",
+            "reranker": "loaded" if reranker is not None else "not_loaded"
+        }
     }
 
 @app.post("/chat", response_model=QueryResponse)

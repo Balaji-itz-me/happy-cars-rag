@@ -1,6 +1,7 @@
 import os
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import Optional
 import psycopg2
@@ -288,16 +289,344 @@ ANSWER:
     }
 
 # API Endpoints
-@app.get("/")
+@app.get("/", response_class=HTMLResponse)
 def root():
-    return {
-        "message": "Happy Cars RAG API",
-        "version": "1.0",
-        "endpoints": {
-            "POST /chat": "Ask questions about cars",
-            "GET /health": "Health check"
-        }
-    }
+    """Serve the chat UI"""
+    html_content = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Happy Cars - Ask About Any Car</title>
+        <style>
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                min-height: 100vh;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                padding: 20px;
+            }
+            .container {
+                background: white;
+                border-radius: 20px;
+                box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+                max-width: 800px;
+                width: 100%;
+                padding: 40px;
+            }
+            .header { text-align: center; margin-bottom: 30px; }
+            .header h1 { color: #333; font-size: 2.5em; margin-bottom: 10px; }
+            .header .icon { font-size: 3em; margin-bottom: 10px; }
+            .header p { color: #666; font-size: 1.1em; }
+            .chat-container {
+                background: #f8f9fa;
+                border-radius: 15px;
+                padding: 20px;
+                margin-bottom: 20px;
+                max-height: 400px;
+                overflow-y: auto;
+            }
+            .message {
+                margin-bottom: 15px;
+                padding: 15px;
+                border-radius: 10px;
+                animation: fadeIn 0.3s ease-in;
+            }
+            @keyframes fadeIn {
+                from { opacity: 0; transform: translateY(10px); }
+                to { opacity: 1; transform: translateY(0); }
+            }
+            .message.user { background: #667eea; color: white; margin-left: 20%; }
+            .message.assistant {
+                background: white;
+                color: #333;
+                margin-right: 20%;
+                border: 1px solid #e0e0e0;
+            }
+            .message.error { background: #fee; color: #c00; border: 1px solid #fcc; }
+            .sources {
+                margin-top: 10px;
+                padding-top: 10px;
+                border-top: 1px solid #e0e0e0;
+                font-size: 0.9em;
+                color: #666;
+            }
+            .source-item {
+                margin: 5px 0;
+                padding: 5px;
+                background: #f0f0f0;
+                border-radius: 5px;
+                font-size: 0.85em;
+            }
+            .input-group { margin-bottom: 15px; }
+            label {
+                display: block;
+                margin-bottom: 5px;
+                color: #666;
+                font-weight: 500;
+                font-size: 0.9em;
+            }
+            input, textarea {
+                width: 100%;
+                padding: 12px;
+                border: 2px solid #e0e0e0;
+                border-radius: 10px;
+                font-size: 1em;
+                transition: border-color 0.3s;
+            }
+            input:focus, textarea:focus {
+                outline: none;
+                border-color: #667eea;
+            }
+            textarea {
+                resize: vertical;
+                min-height: 60px;
+                font-family: inherit;
+            }
+            .button-group { display: flex; gap: 10px; }
+            button {
+                flex: 1;
+                padding: 15px;
+                border: none;
+                border-radius: 10px;
+                font-size: 1em;
+                font-weight: 600;
+                cursor: pointer;
+                transition: all 0.3s;
+            }
+            button.primary { background: #667eea; color: white; }
+            button.primary:hover:not(:disabled) {
+                background: #5568d3;
+                transform: translateY(-2px);
+                box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+            }
+            button.secondary { background: #e0e0e0; color: #666; }
+            button.secondary:hover { background: #d0d0d0; }
+            button:disabled { opacity: 0.6; cursor: not-allowed; }
+            .loading { display: none; text-align: center; padding: 20px; color: #667eea; }
+            .loading.active { display: block; }
+            .spinner {
+                border: 3px solid #f3f3f3;
+                border-top: 3px solid #667eea;
+                border-radius: 50%;
+                width: 40px;
+                height: 40px;
+                animation: spin 1s linear infinite;
+                margin: 0 auto 10px;
+            }
+            @keyframes spin {
+                0% { transform: rotate(0deg); }
+                100% { transform: rotate(360deg); }
+            }
+            .suggestions {
+                display: flex;
+                gap: 10px;
+                flex-wrap: wrap;
+                margin-bottom: 20px;
+            }
+            .suggestion-chip {
+                background: #f0f0f0;
+                padding: 8px 15px;
+                border-radius: 20px;
+                font-size: 0.9em;
+                cursor: pointer;
+                transition: all 0.3s;
+            }
+            .suggestion-chip:hover {
+                background: #667eea;
+                color: white;
+            }
+            .empty-state { text-align: center; padding: 40px; color: #999; }
+            .empty-state .icon { font-size: 3em; margin-bottom: 15px; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <div class="icon">🚗</div>
+                <h1>Happy Cars</h1>
+                <p>Your AI-powered car expert for India</p>
+            </div>
+
+            <div class="suggestions">
+                <div class="suggestion-chip" onclick="useSuggestion('What is the engine power of Hyundai Creta?')">
+                    Engine specs
+                </div>
+                <div class="suggestion-chip" onclick="useSuggestion('Compare Maruti Swift and Hyundai i20')">
+                    Compare cars
+                </div>
+                <div class="suggestion-chip" onclick="useSuggestion('What is the mileage of Honda City?')">
+                    Fuel efficiency
+                </div>
+                <div class="suggestion-chip" onclick="useSuggestion('Tell me about Tata Nexon safety features')">
+                    Safety features
+                </div>
+            </div>
+
+            <div class="chat-container" id="chatContainer">
+                <div class="empty-state">
+                    <div class="icon">💬</div>
+                    <p>Ask me anything about cars available in India!</p>
+                </div>
+            </div>
+
+            <div class="loading" id="loading">
+                <div class="spinner"></div>
+                <p>Thinking...</p>
+            </div>
+
+            <div class="input-group">
+                <label for="question">Your Question</label>
+                <textarea 
+                    id="question" 
+                    placeholder="e.g., What is the price of Maruti Swift?"
+                    onkeypress="handleKeyPress(event)"
+                ></textarea>
+            </div>
+
+            <div class="input-group">
+                <label for="carModel">Filter by Car Model (Optional)</label>
+                <input 
+                    type="text" 
+                    id="carModel" 
+                    placeholder="e.g., Hyundai Creta, Honda City"
+                    list="carModels"
+                >
+                <datalist id="carModels">
+                    <option value="Hyundai Creta">
+                    <option value="Hyundai i20">
+                    <option value="Honda City">
+                    <option value="Maruti Swift">
+                    <option value="Maruti Baleno">
+                    <option value="Tata Nexon">
+                </datalist>
+            </div>
+
+            <div class="button-group">
+                <button class="primary" onclick="askQuestion()" id="askBtn">
+                    Ask Question
+                </button>
+                <button class="secondary" onclick="clearChat()">
+                    Clear Chat
+                </button>
+            </div>
+        </div>
+
+        <script>
+            const API_URL = window.location.origin + '/chat';
+
+            function useSuggestion(text) {
+                document.getElementById('question').value = text;
+                document.getElementById('question').focus();
+            }
+
+            function handleKeyPress(event) {
+                if (event.key === 'Enter' && !event.shiftKey) {
+                    event.preventDefault();
+                    askQuestion();
+                }
+            }
+
+            function addMessage(content, type, sources = []) {
+                const chatContainer = document.getElementById('chatContainer');
+                const emptyState = chatContainer.querySelector('.empty-state');
+                
+                if (emptyState) {
+                    emptyState.remove();
+                }
+
+                const messageDiv = document.createElement('div');
+                messageDiv.className = `message ${type}`;
+                
+                let messageHTML = `<div>${content}</div>`;
+                
+                if (sources && sources.length > 0) {
+                    messageHTML += '<div class="sources"><strong>Sources:</strong>';
+                    sources.forEach(source => {
+                        messageHTML += `<div class="source-item">[${source.id}] ${source.source}</div>`;
+                    });
+                    messageHTML += '</div>';
+                }
+                
+                messageDiv.innerHTML = messageHTML;
+                chatContainer.appendChild(messageDiv);
+                chatContainer.scrollTop = chatContainer.scrollHeight;
+            }
+
+            function clearChat() {
+                const chatContainer = document.getElementById('chatContainer');
+                chatContainer.innerHTML = `
+                    <div class="empty-state">
+                        <div class="icon">💬</div>
+                        <p>Ask me anything about cars available in India!</p>
+                    </div>
+                `;
+            }
+
+            function showLoading(show) {
+                const loading = document.getElementById('loading');
+                const askBtn = document.getElementById('askBtn');
+                
+                if (show) {
+                    loading.classList.add('active');
+                    askBtn.disabled = true;
+                } else {
+                    loading.classList.remove('active');
+                    askBtn.disabled = false;
+                }
+            }
+
+            async function askQuestion() {
+                const question = document.getElementById('question').value.trim();
+                const carModel = document.getElementById('carModel').value.trim();
+
+                if (!question) {
+                    alert('Please enter a question!');
+                    return;
+                }
+
+                addMessage(question, 'user');
+                showLoading(true);
+                document.getElementById('question').value = '';
+
+                try {
+                    const response = await fetch(API_URL, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({
+                            question: question,
+                            model: carModel || null
+                        })
+                    });
+
+                    if (!response.ok) {
+                        throw new Error(`API error: ${response.status}`);
+                    }
+
+                    const data = await response.json();
+                    addMessage(data.answer, 'assistant', data.sources);
+
+                } catch (error) {
+                    console.error('Error:', error);
+                    addMessage(
+                        `Sorry, I encountered an error: ${error.message}. Please try again.`,
+                        'error'
+                    );
+                } finally {
+                    showLoading(false);
+                }
+            }
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
 
 @app.get("/health")
 def health_check():

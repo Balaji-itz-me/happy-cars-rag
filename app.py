@@ -36,19 +36,36 @@ async def lifespan(app: FastAPI):
     # Startup: Initialize only essential connections
     global groq_client, db_conn, db_cur
     
+    # Validate environment variables
+    required_env_vars = ["GROQ_API_KEY", "DB_HOST", "DB_NAME", "DB_USER", "DB_PASSWORD"]
+    missing_vars = [var for var in required_env_vars if not os.environ.get(var)]
+    
+    if missing_vars:
+        raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
+    
     print("Initializing Groq client...")
     groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
     
     print("Connecting to database...")
-    db_conn = psycopg2.connect(
-        host=os.environ.get("DB_HOST"),
-        dbname=os.environ.get("DB_NAME"),
-        user=os.environ.get("DB_USER"),
-        password=os.environ.get("DB_PASSWORD"),
-        port=int(os.environ.get("DB_PORT", 5432)),
-        sslmode="require"
-    )
-    db_cur = db_conn.cursor()
+    print(f"DB Host: {os.environ.get('DB_HOST')}")
+    print(f"DB Name: {os.environ.get('DB_NAME')}")
+    print(f"DB User: {os.environ.get('DB_USER')}")
+    
+    try:
+        db_conn = psycopg2.connect(
+            host=os.environ.get("DB_HOST"),
+            dbname=os.environ.get("DB_NAME"),
+            user=os.environ.get("DB_USER"),
+            password=os.environ.get("DB_PASSWORD"),
+            port=int(os.environ.get("DB_PORT", 5432)),
+            sslmode="require",
+            connect_timeout=10
+        )
+        db_cur = db_conn.cursor()
+        print("✅ Database connected successfully!")
+    except psycopg2.OperationalError as e:
+        print(f"❌ Database connection failed: {e}")
+        raise
     
     print("Startup complete! Models will load on first request.")
     

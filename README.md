@@ -1,6 +1,16 @@
-# Happy Cars RAG API 
+# Happy Cars RAG API 🚗
 
-A Retrieval-Augmented Generation (RAG) system for automotive sales assistance, specifically designed for the Indian car market. This API provides intelligent responses about car specifications, features, and pricing using official documentation, Wikipedia, and automotive datasets.
+**Production Edition v2.0** - A Retrieval-Augmented Generation (RAG) system for automotive sales assistance, specifically designed for the Indian car market.
+
+> ⚡ **Now with API-based embeddings** - Works perfectly on Render free tier with minimal memory usage!
+
+## 🎯 What's New in v2.0
+
+- ✅ **API-based embeddings** (Voyage AI) - No heavy ML models
+- ✅ **Minimal memory** (~100MB vs 2GB)
+- ✅ **Fast startup** (5-10 seconds vs 2-3 minutes)
+- ✅ **No 502 errors** - Reliable on free tier
+- ✅ **Production-ready** - Used by real production systems
 
 ## Features
 
@@ -23,9 +33,10 @@ User Query → Embedding → Vector Search (PostgreSQL + pgvector)
 
 - **Framework**: FastAPI
 - **Database**: PostgreSQL with pgvector extension (Supabase)
-- **Embeddings**: sentence-transformers (all-MiniLM-L6-v2)
-- **Reranking**: cross-encoder/ms-marco-MiniLM-L-6-v2
+- **Embeddings**: Voyage AI API (no local models!)
+- **Reranking**: Simple keyword-based (no heavy ML)
 - **LLM**: Groq (Llama 3.1 8B Instant)
+- **Deployment**: Render (works on free tier!)
 
 ## Setup
 
@@ -34,6 +45,7 @@ User Query → Embedding → Vector Search (PostgreSQL + pgvector)
 - Python 3.10+
 - PostgreSQL with pgvector extension
 - Groq API key
+- **Voyage AI API key** (free tier available)
 
 ### Local Development
 
@@ -289,7 +301,7 @@ This project is licensed under the MIT License.
 
 For questions or issues:
 - Open an issue on GitHub
-- Contact: [balajikamaraj99@gmail.com]
+- Contact: balaikamaraj99@gmail.com
 
 ## Acknowledgments
 

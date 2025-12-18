@@ -133,7 +133,7 @@ Output format:
 You are answering for Indian customers.
 """
 
-def retrieve_candidates(query: str, model_filter: Optional[str] = None, limit: int = 12):
+def retrieve_candidates(query: str, model_filter: Optional[str] = None, limit: int = 15):
     """Retrieve candidate documents from the database"""
     emb = get_embedder()  # Lazy load
     q_embedding = emb.encode(query).tolist()
@@ -145,8 +145,8 @@ def retrieve_candidates(query: str, model_filter: Optional[str] = None, limit: i
         WHERE model ILIKE %s
         ORDER BY
           CASE doc_type
-            WHEN 'official_specs' THEN 1
-            WHEN 'new_car_specs_dataset_2022' THEN 2
+            WHEN 'new_car_specs_dataset_2022' THEN 1
+            WHEN 'official_specs' THEN 2
             WHEN 'wikipedia' THEN 3
             ELSE 4
           END,
@@ -155,6 +155,7 @@ def retrieve_candidates(query: str, model_filter: Optional[str] = None, limit: i
         """
         db_cur.execute(sql, (f"%{model_filter}%", q_embedding, limit))
     else:
+        # For general queries, search broadly
         sql = """
         SELECT model, doc_type, content, source
         FROM car_documents
@@ -453,17 +454,17 @@ def root():
             </div>
 
             <div class="suggestions">
-                <div class="suggestion-chip" onclick="useSuggestion('What is the engine power of Hyundai Creta?')">
-                    Engine specs
+                <div class="suggestion-chip" onclick="useSuggestion('What is the price of Maruti Swift?')">
+                    Price info
                 </div>
-                <div class="suggestion-chip" onclick="useSuggestion('Compare Maruti Swift and Hyundai i20')">
+                <div class="suggestion-chip" onclick="useSuggestion('Compare engine power of Maruti Swift and Hyundai i20')">
                     Compare cars
                 </div>
                 <div class="suggestion-chip" onclick="useSuggestion('What is the mileage of Honda City?')">
                     Fuel efficiency
                 </div>
-                <div class="suggestion-chip" onclick="useSuggestion('Tell me about Tata Nexon safety features')">
-                    Safety features
+                <div class="suggestion-chip" onclick="useSuggestion('Tell me about Hyundai Creta features')">
+                    Car features
                 </div>
             </div>
 
@@ -480,30 +481,12 @@ def root():
             </div>
 
             <div class="input-group">
-                <label for="question">Your Question</label>
+                <label for="question">Ask me anything about cars</label>
                 <textarea 
                     id="question" 
-                    placeholder="e.g., What is the price of Maruti Swift?"
+                    placeholder="e.g., What is the price of Maruti Swift? or Compare Honda City and Hyundai Creta"
                     onkeypress="handleKeyPress(event)"
                 ></textarea>
-            </div>
-
-            <div class="input-group">
-                <label for="carModel">Filter by Car Model (Optional)</label>
-                <input 
-                    type="text" 
-                    id="carModel" 
-                    placeholder="e.g., Hyundai Creta, Honda City"
-                    list="carModels"
-                >
-                <datalist id="carModels">
-                    <option value="Hyundai Creta">
-                    <option value="Hyundai i20">
-                    <option value="Honda City">
-                    <option value="Maruti Swift">
-                    <option value="Maruti Baleno">
-                    <option value="Tata Nexon">
-                </datalist>
             </div>
 
             <div class="button-group">
@@ -582,7 +565,6 @@ def root():
 
             async function askQuestion() {
                 const question = document.getElementById('question').value.trim();
-                const carModel = document.getElementById('carModel').value.trim();
 
                 if (!question) {
                     alert('Please enter a question!');
@@ -601,7 +583,7 @@ def root():
                         },
                         body: JSON.stringify({
                             question: question,
-                            model: carModel || null
+                            model: null
                         })
                     });
 

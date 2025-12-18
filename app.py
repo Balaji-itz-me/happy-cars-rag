@@ -5,32 +5,14 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import Optional
 import psycopg2
-from sentence_transformers import SentenceTransformer, CrossEncoder
 from groq import Groq
+import requests
 from contextlib import asynccontextmanager
 
-# Global variables for models and connections
-embedder = None
-reranker = None
+# Global variables
 groq_client = None
 db_conn = None
 db_cur = None
-
-def get_embedder():
-    """Lazy load embedder only when needed"""
-    global embedder
-    if embedder is None:
-        print("Loading embedder...")
-        embedder = SentenceTransformer("all-MiniLM-L6-v2")
-    return embedder
-
-def get_reranker():
-    """Lazy load reranker only when needed"""
-    global reranker
-    if reranker is None:
-        print("Loading reranker...")
-        reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-    return reranker
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -38,7 +20,7 @@ async def lifespan(app: FastAPI):
     global groq_client, db_conn, db_cur
     
     # Validate environment variables
-    required_env_vars = ["GROQ_API_KEY", "DB_HOST", "DB_NAME", "DB_USER", "DB_PASSWORD"]
+    required_env_vars = ["GROQ_API_KEY", "VOYAGE_API_KEY", "DB_HOST", "DB_NAME", "DB_USER", "DB_PASSWORD"]
     missing_vars = [var for var in required_env_vars if not os.environ.get(var)]
     
     if missing_vars:
@@ -49,8 +31,6 @@ async def lifespan(app: FastAPI):
     
     print("Connecting to database...")
     print(f"DB Host: {os.environ.get('DB_HOST')}")
-    print(f"DB Name: {os.environ.get('DB_NAME')}")
-    print(f"DB User: {os.environ.get('DB_USER')}")
     
     try:
         db_conn = psycopg2.connect(
@@ -68,7 +48,7 @@ async def lifespan(app: FastAPI):
         print(f"❌ Database connection failed: {e}")
         raise
     
-    print("Startup complete! Models will load on first request.")
+    print("✅ Startup complete! Using API-based embeddings (no local models).")
     
     yield
     
@@ -81,8 +61,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Happy Cars RAG API",
-    version="1.0",
-    description="Automotive sales assistant API for Happy Cars India",
+    version="2.0",
+    description="Automotive sales assistant API for Happy Cars India - Production Edition",
     lifespan=lifespan
 )
 
@@ -123,7 +103,6 @@ Rules (MANDATORY):
 Citation rules:
 - Each citation must correspond to a source listed at the end.
 - If multiple sources support a statement, cite all.
-- Do NOT include a "Sources:" section.
 - Use citation numbers like [1], [2] in the answer text only.
 
 Output format:
@@ -133,10 +112,30 @@ Output format:
 You are answering for Indian customers.
 """
 
-def retrieve_candidates(query: str, model_filter: Optional[str] = None, limit: int = 15):
-    """Retrieve candidate documents from the database"""
-    emb = get_embedder()  # Lazy load
-    q_embedding = emb.encode(query).tolist()
+def get_voyage_embedding(text: str) -> list:
+    """Get embeddings from Voyage AI API"""
+    url = "https://api.voyageai.com/v1/embeddings"
+    headers = {
+        "Authorization": f"Bearer {os.environ.get('VOYAGE_API_KEY')}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "input": text,
+        "model": "voyage-2"  # Good for general retrieval
+    }
+    
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        return data["data"][0]["embedding"]
+    except Exception as e:
+        print(f"Voyage API error: {e}")
+        raise HTTPException(status_code=500, detail=f"Embedding API error: {str(e)}")
+
+def retrieve_candidates(query: str, model_filter: Optional[str] = None, limit: int = 10):
+    """Retrieve candidate documents from the database using API embeddings"""
+    q_embedding = get_voyage_embedding(query)
     
     if model_filter:
         sql = """
@@ -155,7 +154,6 @@ def retrieve_candidates(query: str, model_filter: Optional[str] = None, limit: i
         """
         db_cur.execute(sql, (f"%{model_filter}%", q_embedding, limit))
     else:
-        # For general queries, search broadly
         sql = """
         SELECT model, doc_type, content, source
         FROM car_documents
@@ -176,46 +174,47 @@ def retrieve_candidates(query: str, model_filter: Optional[str] = None, limit: i
         for r in rows
     ]
 
-def is_good_spec_chunk(text: str) -> bool:
-    """Filter out noisy official spec chunks"""
-    text_lower = text.lower()
+def simple_rerank(query: str, docs: list, top_k: int = 3):
+    """
+    Simple reranking based on keyword matching and doc type priority.
+    No heavy ML models needed.
+    """
+    query_lower = query.lower()
+    query_keywords = set(query_lower.split())
     
-    spec_indicators = ["bhp", "nm", "cc", "engine", "power", "torque"]
-    ui_noise = ["otp", "menu", "share", "submit", "click", "stay in touch"]
+    scored_docs = []
     
-    if not any(s in text_lower for s in spec_indicators):
-        return False
+    for doc in docs:
+        score = 0
+        text_lower = doc["text"].lower()
+        
+        # Keyword overlap score
+        text_keywords = set(text_lower.split())
+        common_keywords = query_keywords.intersection(text_keywords)
+        score += len(common_keywords) * 2
+        
+        # Boost for spec indicators
+        spec_indicators = ["bhp", "price", "₹", "nm", "cc", "mileage", "kmpl"]
+        for indicator in spec_indicators:
+            if indicator in text_lower:
+                score += 5
+        
+        # Type priority
+        if doc["type"] == "new_car_specs_dataset_2022":
+            score += 10
+        elif doc["type"] == "official_specs":
+            score += 5
+        
+        # Filter out noisy content
+        noise_keywords = ["otp", "submit", "menu", "click"]
+        if any(noise in text_lower for noise in noise_keywords):
+            score -= 20
+        
+        scored_docs.append((score, doc))
     
-    if any(n in text_lower for n in ui_noise):
-        return False
-    
-    return True
-
-def rerank_docs(query: str, docs: list, top_k: int = 3):
-    """Rerank documents using cross-encoder"""
-    filtered = []
-    
-    for d in docs:
-        if d["type"] == "official_specs":
-            if is_good_spec_chunk(d["text"]):
-                filtered.append(d)
-        else:
-            filtered.append(d)
-    
-    if not filtered:
-        return []
-    
-    ranker = get_reranker()  # Lazy load
-    pairs = [(query, d["text"]) for d in filtered]
-    scores = ranker.predict(pairs)
-    
-    ranked = sorted(
-        zip(scores, filtered),
-        key=lambda x: x[0],
-        reverse=True
-    )
-    
-    return [doc for _, doc in ranked[:top_k]]
+    # Sort by score and return top_k
+    scored_docs.sort(key=lambda x: x[0], reverse=True)
+    return [doc for _, doc in scored_docs[:top_k]]
 
 def build_context(docs: list) -> str:
     """Build context string from documents"""
@@ -231,7 +230,7 @@ def build_context(docs: list) -> str:
     return "\n\n".join(blocks)
 
 def answer_query(query: str, model_filter: Optional[str] = None) -> dict:
-    """Main RAG pipeline"""
+    """Main RAG pipeline with API-based embeddings"""
     # 1. Retrieve candidates
     candidates = retrieve_candidates(query, model_filter=model_filter)
     
@@ -241,8 +240,8 @@ def answer_query(query: str, model_filter: Optional[str] = None) -> dict:
             "sources": []
         }
     
-    # 2. Rerank
-    top_docs = rerank_docs(query, candidates)
+    # 2. Simple rerank (no heavy models)
+    top_docs = simple_rerank(query, candidates, top_k=3)
     
     if not top_docs:
         return {
@@ -323,6 +322,16 @@ def root():
             .header h1 { color: #333; font-size: 2.5em; margin-bottom: 10px; }
             .header .icon { font-size: 3em; margin-bottom: 10px; }
             .header p { color: #666; font-size: 1.1em; }
+            .badge {
+                display: inline-block;
+                background: #10b981;
+                color: white;
+                padding: 4px 12px;
+                border-radius: 12px;
+                font-size: 0.75em;
+                font-weight: 600;
+                margin-top: 10px;
+            }
             .chat-container {
                 background: #f8f9fa;
                 border-radius: 15px;
@@ -371,22 +380,20 @@ def root():
                 font-weight: 500;
                 font-size: 0.9em;
             }
-            input, textarea {
+            textarea {
                 width: 100%;
                 padding: 12px;
                 border: 2px solid #e0e0e0;
                 border-radius: 10px;
                 font-size: 1em;
                 transition: border-color 0.3s;
-            }
-            input:focus, textarea:focus {
-                outline: none;
-                border-color: #667eea;
-            }
-            textarea {
                 resize: vertical;
                 min-height: 60px;
                 font-family: inherit;
+            }
+            textarea:focus {
+                outline: none;
+                border-color: #667eea;
             }
             .button-group { display: flex; gap: 10px; }
             button {
@@ -451,6 +458,7 @@ def root():
                 <div class="icon">🚗</div>
                 <h1>Happy Cars</h1>
                 <p>Your AI-powered car expert for India</p>
+                <span class="badge">⚡ Production Edition</span>
             </div>
 
             <div class="suggestions">
@@ -614,7 +622,6 @@ def root():
 def health_check():
     """Health check endpoint"""
     try:
-        # Test database connection
         db_cur.execute("SELECT 1;")
         db_status = "connected"
     except Exception as e:
@@ -622,11 +629,10 @@ def health_check():
     
     return {
         "status": "healthy",
+        "version": "2.0-production",
         "database": db_status,
-        "models": {
-            "embedder": "loaded" if embedder is not None else "not_loaded",
-            "reranker": "loaded" if reranker is not None else "not_loaded"
-        }
+        "embedding_provider": "Voyage AI",
+        "memory_usage": "minimal"
     }
 
 @app.post("/chat", response_model=QueryResponse)
@@ -635,7 +641,7 @@ def chat(req: QueryRequest):
     Main chat endpoint for asking questions about cars
     
     - **question**: The user's question
-    - **model**: Optional filter for specific car model (e.g., "Hyundai Creta")
+    - **model**: Optional filter for specific car model (usually not needed)
     """
     try:
         result = answer_query(

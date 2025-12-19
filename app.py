@@ -5,59 +5,85 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import Optional
 import psycopg2
+from psycopg2.extras import RealDictCursor
+from psycopg2.pool import SimpleConnectionPool
 from groq import Groq
 import requests
 from contextlib import asynccontextmanager
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Global variables
 groq_client = None
-db_conn = None
-db_cur = None
+db_pool = None
+
+# Configuration
+VOYAGE_API_TIMEOUT = 10  # seconds
+GROQ_API_TIMEOUT = 30  # seconds
+DB_CONNECT_TIMEOUT = 10  # seconds
+MAX_RETRIES = 2
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup: Initialize only essential connections
-    global groq_client, db_conn, db_cur
+    global groq_client, db_pool
     
     # Validate environment variables
     required_env_vars = ["GROQ_API_KEY", "VOYAGE_API_KEY", "DB_HOST", "DB_NAME", "DB_USER", "DB_PASSWORD"]
     missing_vars = [var for var in required_env_vars if not os.environ.get(var)]
     
     if missing_vars:
+        logger.error(f"Missing environment variables: {missing_vars}")
         raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
     
-    print("Initializing Groq client...")
-    groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+    logger.info("Initializing Groq client...")
+    try:
+        groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+        logger.info("✅ Groq client initialized")
+    except Exception as e:
+        logger.error(f"Failed to initialize Groq client: {e}")
+        raise
     
-    print("Connecting to database...")
-    print(f"DB Host: {os.environ.get('DB_HOST')}")
+    logger.info("Creating database connection pool...")
+    logger.info(f"DB Host: {os.environ.get('DB_HOST')}")
     
     try:
-        db_conn = psycopg2.connect(
+        db_pool = SimpleConnectionPool(
+            minconn=1,
+            maxconn=5,
             host=os.environ.get("DB_HOST"),
             dbname=os.environ.get("DB_NAME"),
             user=os.environ.get("DB_USER"),
             password=os.environ.get("DB_PASSWORD"),
             port=int(os.environ.get("DB_PORT", 5432)),
             sslmode="require",
-            connect_timeout=10
+            connect_timeout=DB_CONNECT_TIMEOUT
         )
-        db_cur = db_conn.cursor()
-        print("✅ Database connected successfully!")
-    except psycopg2.OperationalError as e:
-        print(f"❌ Database connection failed: {e}")
+        
+        # Test connection
+        conn = db_pool.getconn()
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1;")
+        cursor.close()
+        db_pool.putconn(conn)
+        
+        logger.info("✅ Database pool created and tested successfully!")
+    except Exception as e:
+        logger.error(f"❌ Database connection failed: {e}")
         raise
     
-    print("✅ Startup complete! Using API-based embeddings (no local models).")
+    logger.info("✅ Startup complete! Using API-based embeddings (no local models).")
     
     yield
     
-    # Shutdown: Close connections
-    if db_cur:
-        db_cur.close()
-    if db_conn:
-        db_conn.close()
-    print("Shutdown complete!")
+    # Shutdown: Close all connections
+    if db_pool:
+        db_pool.closeall()
+        logger.info("Database pool closed")
+    logger.info("Shutdown complete!")
 
 app = FastAPI(
     title="Happy Cars RAG API",
@@ -112,8 +138,33 @@ Output format:
 You are answering for Indian customers.
 """
 
+def get_db_connection():
+    """Get a database connection from the pool with retry logic"""
+    if not db_pool:
+        raise Exception("Database pool not initialized")
+    
+    for attempt in range(MAX_RETRIES):
+        try:
+            conn = db_pool.getconn()
+            if conn.closed:
+                db_pool.putconn(conn)
+                raise psycopg2.OperationalError("Connection was closed")
+            return conn
+        except Exception as e:
+            logger.warning(f"DB connection attempt {attempt + 1} failed: {e}")
+            if attempt == MAX_RETRIES - 1:
+                raise
+    
+def release_db_connection(conn):
+    """Release connection back to pool"""
+    if conn and db_pool:
+        try:
+            db_pool.putconn(conn)
+        except Exception as e:
+            logger.error(f"Error releasing connection: {e}")
+
 def get_voyage_embedding(text: str) -> list:
-    """Get embeddings from Voyage AI API"""
+    """Get embeddings from Voyage AI API with timeout and retry"""
     url = "https://api.voyageai.com/v1/embeddings"
     headers = {
         "Authorization": f"Bearer {os.environ.get('VOYAGE_API_KEY')}",
@@ -121,58 +172,101 @@ def get_voyage_embedding(text: str) -> list:
     }
     payload = {
         "input": text,
-        "model": "voyage-2"  # Good for general retrieval
+        "model": "voyage-2"
     }
     
-    try:
-        response = requests.post(url, json=payload, headers=headers, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        return data["data"][0]["embedding"]
-    except Exception as e:
-        print(f"Voyage API error: {e}")
-        raise HTTPException(status_code=500, detail=f"Embedding API error: {str(e)}")
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = requests.post(
+                url, 
+                json=payload, 
+                headers=headers, 
+                timeout=VOYAGE_API_TIMEOUT
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data["data"][0]["embedding"]
+        except requests.exceptions.Timeout:
+            logger.warning(f"Voyage API timeout (attempt {attempt + 1}/{MAX_RETRIES})")
+            if attempt == MAX_RETRIES - 1:
+                raise HTTPException(
+                    status_code=504, 
+                    detail="Embedding service timeout. Please try again."
+                )
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Voyage API error (attempt {attempt + 1}/{MAX_RETRIES}): {e}")
+            if attempt == MAX_RETRIES - 1:
+                raise HTTPException(
+                    status_code=503, 
+                    detail="Embedding service unavailable. Please try again later."
+                )
+        except Exception as e:
+            logger.error(f"Unexpected error in Voyage API: {e}")
+            raise HTTPException(
+                status_code=500, 
+                detail="Failed to generate embeddings"
+            )
 
 def retrieve_candidates(query: str, model_filter: Optional[str] = None, limit: int = 10):
     """Retrieve candidate documents from the database using API embeddings"""
-    q_embedding = get_voyage_embedding(query)
-    
-    if model_filter:
-        sql = """
-        SELECT model, doc_type, content, source
-        FROM car_documents
-        WHERE model ILIKE %s
-        ORDER BY
-          CASE doc_type
-            WHEN 'new_car_specs_dataset_2022' THEN 1
-            WHEN 'official_specs' THEN 2
-            WHEN 'wikipedia' THEN 3
-            ELSE 4
-          END,
-          embedding <-> %s::vector
-        LIMIT %s;
-        """
-        db_cur.execute(sql, (f"%{model_filter}%", q_embedding, limit))
-    else:
-        sql = """
-        SELECT model, doc_type, content, source
-        FROM car_documents
-        ORDER BY embedding <-> %s::vector
-        LIMIT %s;
-        """
-        db_cur.execute(sql, (q_embedding, limit))
-    
-    rows = db_cur.fetchall()
-    
-    return [
-        {
-            "model": r[0],
-            "type": r[1],
-            "text": r[2],
-            "source": r[3]
-        }
-        for r in rows
-    ]
+    conn = None
+    try:
+        # Get embedding
+        q_embedding = get_voyage_embedding(query)
+        
+        # Get DB connection
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        if model_filter:
+            sql = """
+            SELECT model, doc_type, content, source
+            FROM car_documents
+            WHERE model ILIKE %s
+            ORDER BY
+              CASE doc_type
+                WHEN 'new_car_specs_dataset_2022' THEN 1
+                WHEN 'official_specs' THEN 2
+                WHEN 'wikipedia' THEN 3
+                ELSE 4
+              END,
+              embedding <-> %s::vector
+            LIMIT %s;
+            """
+            cursor.execute(sql, (f"%{model_filter}%", q_embedding, limit))
+        else:
+            sql = """
+            SELECT model, doc_type, content, source
+            FROM car_documents
+            ORDER BY embedding <-> %s::vector
+            LIMIT %s;
+            """
+            cursor.execute(sql, (q_embedding, limit))
+        
+        rows = cursor.fetchall()
+        cursor.close()
+        
+        return [
+            {
+                "model": r[0],
+                "type": r[1],
+                "text": r[2],
+                "source": r[3]
+            }
+            for r in rows
+        ]
+    except psycopg2.Error as e:
+        logger.error(f"Database error in retrieve_candidates: {e}")
+        raise HTTPException(
+            status_code=500, 
+            detail="Database error. Please try again."
+        )
+    except Exception as e:
+        logger.error(f"Unexpected error in retrieve_candidates: {e}")
+        raise
+    finally:
+        if conn:
+            release_db_connection(conn)
 
 def simple_rerank(query: str, docs: list, top_k: int = 3):
     """
@@ -230,29 +324,37 @@ def build_context(docs: list) -> str:
     return "\n\n".join(blocks)
 
 def answer_query(query: str, model_filter: Optional[str] = None) -> dict:
-    """Main RAG pipeline with API-based embeddings"""
-    # 1. Retrieve candidates
-    candidates = retrieve_candidates(query, model_filter=model_filter)
-    
-    if not candidates:
-        return {
-            "answer": "The information is not available in the provided data.",
-            "sources": []
-        }
-    
-    # 2. Simple rerank (no heavy models)
-    top_docs = simple_rerank(query, candidates, top_k=3)
-    
-    if not top_docs:
-        return {
-            "answer": "The information is not available in the provided data.",
-            "sources": []
-        }
-    
-    # 3. Build context
-    context = build_context(top_docs)
-    
-    user_prompt = f"""
+    """Main RAG pipeline with API-based embeddings and comprehensive error handling"""
+    try:
+        # 1. Retrieve candidates
+        logger.info(f"Processing query: {query[:50]}...")
+        candidates = retrieve_candidates(query, model_filter=model_filter)
+        
+        if not candidates:
+            logger.warning("No candidates found")
+            return {
+                "answer": "I couldn't find any relevant information about that. Could you try rephrasing your question?",
+                "sources": []
+            }
+        
+        logger.info(f"Retrieved {len(candidates)} candidates")
+        
+        # 2. Simple rerank (no heavy models)
+        top_docs = simple_rerank(query, candidates, top_k=3)
+        
+        if not top_docs:
+            logger.warning("No documents after reranking")
+            return {
+                "answer": "I couldn't find specific information about that. Please try asking about specific car models available in India.",
+                "sources": []
+            }
+        
+        logger.info(f"Reranked to {len(top_docs)} documents")
+        
+        # 3. Build context
+        context = build_context(top_docs)
+        
+        user_prompt = f"""
 CONTEXT:
 {context}
 
@@ -261,32 +363,50 @@ QUESTION:
 
 ANSWER:
 """
-    
-    # 4. Call LLM (Groq)
-    try:
-        response = groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt}
-            ],
-            temperature=0.1,
-            max_tokens=512
-        )
         
-        answer = response.choices[0].message.content
+        # 4. Call LLM (Groq) with timeout
+        try:
+            logger.info("Calling Groq LLM...")
+            response = groq_client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.1,
+                max_tokens=512,
+                timeout=GROQ_API_TIMEOUT
+            )
+            
+            answer = response.choices[0].message.content
+            logger.info("LLM response received")
+            
+        except Exception as e:
+            logger.error(f"Groq API error: {e}")
+            raise HTTPException(
+                status_code=503, 
+                detail="AI service temporarily unavailable. Please try again."
+            )
+        
+        sources = [
+            {"id": i + 1, "source": d["source"]}
+            for i, d in enumerate(top_docs)
+        ]
+        
+        return {
+            "answer": answer,
+            "sources": sources
+        }
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"LLM error: {str(e)}")
-    
-    sources = [
-        {"id": i + 1, "source": d["source"]}
-        for i, d in enumerate(top_docs)
-    ]
-    
-    return {
-        "answer": answer,
-        "sources": sources
-    }
+        logger.error(f"Unexpected error in answer_query: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail="An unexpected error occurred. Please try again."
+        )
 
 # API Endpoints
 @app.get("/", response_class=HTMLResponse)
@@ -620,20 +740,40 @@ def root():
 
 @app.get("/health")
 def health_check():
-    """Health check endpoint"""
-    try:
-        db_cur.execute("SELECT 1;")
-        db_status = "connected"
-    except Exception as e:
-        db_status = f"error: {str(e)}"
-    
-    return {
+    """Health check endpoint with detailed status"""
+    status = {
         "status": "healthy",
         "version": "2.0-production",
-        "database": db_status,
         "embedding_provider": "Voyage AI",
         "memory_usage": "minimal"
     }
+    
+    # Check database
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1;")
+        cursor.close()
+        status["database"] = "connected"
+    except Exception as e:
+        logger.error(f"Health check DB error: {e}")
+        status["database"] = f"error: {str(e)}"
+        status["status"] = "degraded"
+    finally:
+        if conn:
+            release_db_connection(conn)
+    
+    # Check Voyage AI
+    try:
+        test_embedding = get_voyage_embedding("test")
+        status["voyage_ai"] = "connected"
+    except Exception as e:
+        logger.error(f"Health check Voyage error: {e}")
+        status["voyage_ai"] = "error"
+        status["status"] = "degraded"
+    
+    return status
 
 @app.post("/chat", response_model=QueryResponse)
 def chat(req: QueryRequest):
@@ -643,14 +783,58 @@ def chat(req: QueryRequest):
     - **question**: The user's question
     - **model**: Optional filter for specific car model (usually not needed)
     """
+    # Comprehensive error handling wrapper
     try:
+        # Validate input
+        if not req.question or len(req.question.strip()) == 0:
+            raise HTTPException(
+                status_code=400, 
+                detail="Question cannot be empty"
+            )
+        
+        if len(req.question) > 500:
+            raise HTTPException(
+                status_code=400, 
+                detail="Question is too long. Please keep it under 500 characters."
+            )
+        
+        # Process query
+        logger.info(f"Received question: {req.question[:100]}...")
         result = answer_query(
             query=req.question,
             model_filter=req.model
         )
+        logger.info("Successfully processed query")
         return result
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except psycopg2.Error as e:
+        logger.error(f"Database error in chat endpoint: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=503,
+            detail="Database connection error. Please try again in a moment."
+        )
+    except requests.exceptions.Timeout:
+        logger.error("External API timeout")
+        raise HTTPException(
+            status_code=504,
+            detail="Request timeout. Please try again."
+        )
+    except requests.exceptions.RequestException as e:
+        logger.error(f"External API error: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail="External service unavailable. Please try again later."
+        )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # Catch-all for unexpected errors
+        logger.error(f"Unexpected error in chat endpoint: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail="An unexpected error occurred. Our team has been notified. Please try again."
+        )
 
 if __name__ == "__main__":
     import uvicorn

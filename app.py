@@ -172,7 +172,7 @@ def get_voyage_embedding(text: str) -> list:
     }
     payload = {
         "input": text,
-        "model": "voyage-2"
+        "model": "voyage-lite-02-instruct"  # 384 dimensions - matches your DB!
     }
     
     for attempt in range(MAX_RETRIES):

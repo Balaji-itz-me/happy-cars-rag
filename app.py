@@ -31,8 +31,14 @@ async def lifespan(app: FastAPI):
     # Startup: Initialize only essential connections
     global groq_client, db_pool
     
-    # Validate environment variables
-    required_env_vars = ["GROQ_API_KEY", "VOYAGE_API_KEY", "DB_HOST", "DB_NAME", "DB_USER", "DB_PASSWORD"]
+    # Validate environment variables - support both Voyage and Cohere
+    required_env_vars = ["GROQ_API_KEY", "DB_HOST", "DB_NAME", "DB_USER", "DB_PASSWORD"]
+    
+    # Check for either Voyage or Cohere API key
+    if not os.environ.get("VOYAGE_API_KEY") and not os.environ.get("COHERE_API_KEY"):
+        logger.error("Missing embedding API key (need either VOYAGE_API_KEY or COHERE_API_KEY)")
+        raise ValueError("Missing embedding API key")
+    
     missing_vars = [var for var in required_env_vars if not os.environ.get(var)]
     
     if missing_vars:
@@ -74,6 +80,12 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"❌ Database connection failed: {e}")
         raise
+    
+    # Log which embedding provider we're using
+    if os.environ.get("COHERE_API_KEY"):
+        logger.info("✅ Using Cohere embeddings (384 dimensions)")
+    else:
+        logger.info("✅ Using Voyage AI embeddings")
     
     logger.info("✅ Startup complete! Using API-based embeddings (no local models).")
     
@@ -163,6 +175,64 @@ def release_db_connection(conn):
         except Exception as e:
             logger.error(f"Error releasing connection: {e}")
 
+def get_embedding(text: str) -> list:
+    """
+    Get embeddings using available API (Cohere or Voyage)
+    Cohere embed-english-light-v3.0 = 384 dimensions (matches your DB!)
+    """
+    # Try Cohere first (384 dimensions - perfect match!)
+    if os.environ.get("COHERE_API_KEY"):
+        return get_cohere_embedding(text)
+    # Fallback to Voyage
+    else:
+        return get_voyage_embedding(text)
+
+def get_cohere_embedding(text: str) -> list:
+    """Get embeddings from Cohere API (384 dimensions)"""
+    url = "https://api.cohere.ai/v1/embed"
+    headers = {
+        "Authorization": f"Bearer {os.environ.get('COHERE_API_KEY')}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "texts": [text],
+        "model": "embed-english-light-v3.0",  # 384 dimensions!
+        "input_type": "search_query",
+        "truncate": "END"
+    }
+    
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = requests.post(
+                url, 
+                json=payload, 
+                headers=headers, 
+                timeout=VOYAGE_API_TIMEOUT
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data["embeddings"][0]
+        except requests.exceptions.Timeout:
+            logger.warning(f"Cohere API timeout (attempt {attempt + 1}/{MAX_RETRIES})")
+            if attempt == MAX_RETRIES - 1:
+                raise HTTPException(
+                    status_code=504, 
+                    detail="Embedding service timeout. Please try again."
+                )
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Cohere API error (attempt {attempt + 1}/{MAX_RETRIES}): {e}")
+            if attempt == MAX_RETRIES - 1:
+                raise HTTPException(
+                    status_code=503, 
+                    detail="Embedding service unavailable. Please try again later."
+                )
+        except Exception as e:
+            logger.error(f"Unexpected error in Cohere API: {e}")
+            raise HTTPException(
+                status_code=500, 
+                detail="Failed to generate embeddings"
+            )
+
 def get_voyage_embedding(text: str) -> list:
     """Get embeddings from Voyage AI API with timeout and retry"""
     url = "https://api.voyageai.com/v1/embeddings"
@@ -211,8 +281,8 @@ def retrieve_candidates(query: str, model_filter: Optional[str] = None, limit: i
     """Retrieve candidate documents from the database using API embeddings"""
     conn = None
     try:
-        # Get embedding
-        q_embedding = get_voyage_embedding(query)
+        # Get embedding using available API
+        q_embedding = get_embedding(query)
         
         # Get DB connection
         conn = get_db_connection()
@@ -764,13 +834,17 @@ def health_check():
         if conn:
             release_db_connection(conn)
     
-    # Check Voyage AI
+    # Check Cohere or Voyage AI
     try:
-        test_embedding = get_voyage_embedding("test")
-        status["voyage_ai"] = "connected"
+        if os.environ.get("COHERE_API_KEY"):
+            test_embedding = get_cohere_embedding("test")
+            status["embedding_api"] = "Cohere (384d)"
+        else:
+            test_embedding = get_voyage_embedding("test")
+            status["embedding_api"] = "Voyage AI"
     except Exception as e:
-        logger.error(f"Health check Voyage error: {e}")
-        status["voyage_ai"] = "error"
+        logger.error(f"Health check embedding API error: {e}")
+        status["embedding_api"] = "error"
         status["status"] = "degraded"
     
     return status
